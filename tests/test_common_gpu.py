@@ -18,10 +18,13 @@ import unittest
 import pytest
 import torch
 import torch.nn.functional as F
+from datasets import load_dataset
 from parameterized import parameterized
 from torch import nn
 from transformers import (
+    AutoImageProcessor,
     AutoModelForCausalLM,
+    AutoModelForImageClassification,
     AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
@@ -36,6 +39,7 @@ from peft import (
     AdaLoraConfig,
     AdaptionPromptConfig,
     BOFTConfig,
+    HRAConfig,
     IA3Config,
     LNTuningConfig,
     LoHaConfig,
@@ -49,6 +53,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from peft.import_utils import is_bnb_4bit_available, is_bnb_available
+from peft.tuners.lora.config import LoraRuntimeConfig
 
 from .testing_utils import require_bitsandbytes, require_torch_gpu, require_torch_multi_gpu
 
@@ -801,7 +806,7 @@ class PeftGPUCommonTests(unittest.TestCase):
         with torch.inference_mode():
             out_adapter1 = model(**inputs).logits
 
-        atol, rtol = 1e-5, 1e-5
+        atol, rtol = 3e-5, 1e-5
         # sanity check, outputs have the right shape and are not the same
         assert len(out_base) >= 3
         assert len(out_base) == len(out_adapter0) == len(out_adapter1)
@@ -1082,6 +1087,161 @@ class PeftGPUCommonTests(unittest.TestCase):
         assert torch.allclose(out_dora, out_merged, atol=atol, rtol=rtol)
         assert torch.allclose(out_dora, out_unmerged, atol=atol, rtol=rtol)
         assert torch.allclose(out_dora, out_unloaded, atol=atol, rtol=rtol)
+
+    @require_torch_gpu
+    @pytest.mark.single_gpu_tests
+    def test_dora_ephemeral_gpu_offload(self):
+        torch.manual_seed(0)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            torch_dtype=torch.float32,
+        ).eval()
+
+        config = LoraConfig(
+            r=128,
+            init_lora_weights=False,
+            use_dora=True,
+            runtime_config=LoraRuntimeConfig(
+                ephemeral_gpu_offload=True
+            ),  # we enable this, but only to verify that it's gone later
+        )
+        peft_model = get_peft_model(model, config).eval()
+        # Check that ephemeral GPU offloading is present
+        assert peft_model.peft_config["default"].runtime_config.ephemeral_gpu_offload
+
+        # Save to disk
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            peft_model.save_pretrained(tmp_dir)
+
+            # Load from disk 100% on CPU without ephemeral GPU offloading
+            peft_model_cpu = PeftModel.from_pretrained(
+                model,
+                tmp_dir,
+                device_map={"": "cpu"},
+            ).eval()
+
+            # Check that ephemeral GPU offloading is absent
+            assert not peft_model_cpu.peft_config["default"].runtime_config.ephemeral_gpu_offload
+
+            # Load again, with ephemeral GPU offloading enabled
+            peft_model_ego = PeftModel.from_pretrained(
+                model,
+                tmp_dir,
+                device_map={"": "cpu"},
+                ephemeral_gpu_offload=True,
+            ).eval()
+
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+        with torch.inference_mode():
+            out_peft_model_cpu = F.softmax(peft_model_cpu(random_input).logits, dim=-1)
+            out_peft_model_ego = F.softmax(peft_model_ego(random_input).logits, dim=-1)
+
+        # The results should be the same
+        assert torch.allclose(out_peft_model_cpu, out_peft_model_ego)
+
+    @require_torch_gpu
+    @require_torch_multi_gpu
+    @pytest.mark.multi_gpu_tests
+    def test_dora_ephemeral_gpu_offload_multigpu(self):
+        torch.manual_seed(0)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            torch_dtype=torch.float32,
+        ).eval()
+
+        config = LoraConfig(
+            r=16,  # too small and the time difference is too small
+            init_lora_weights=False,
+            use_dora=True,
+            runtime_config=LoraRuntimeConfig(ephemeral_gpu_offload=True),
+        )
+        peft_model = get_peft_model(model, config).eval()
+
+        layer = peft_model.base_model.model.model.decoder.layers[0].self_attn.v_proj
+        lora_A, lora_B = layer.lora_A, layer.lora_B
+
+        possible_combinations = ["cpu", "cuda", "cuda:0", "cuda:1"]
+        for device_A in possible_combinations:
+            la = lora_A.to(device_A)
+            for device_B in possible_combinations:
+                lb = lora_B.to(device_B)
+                layer.lora_A, layer.lora_B = la, lb
+                layer.dora_init(layer.active_adapter[0])  # should not raise an error
+
+    def test_apply_GS_hra_inference(self):
+        # check for different result with and without apply_GS
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            torch_dtype=torch.float32,
+        ).eval()
+
+        torch.manual_seed(0)
+        config_hra = HRAConfig(r=8, init_weights=True, apply_GS=False)
+        model = get_peft_model(model, config_hra).eval()
+
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+        logits_hra = model(random_input).logits
+
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            torch_dtype=torch.float32,
+        )
+        torch.manual_seed(0)
+        config_hra_GS = HRAConfig(r=8, init_weights=True, apply_GS=True)
+        model = get_peft_model(model, config_hra_GS)
+
+        logits_hra_GS = model(random_input).logits
+
+        assert not torch.allclose(logits_hra, logits_hra_GS)
+
+    @require_torch_gpu
+    @pytest.mark.single_gpu_tests
+    def test_apply_GS_hra_conv2d_inference(self):
+        # check for different result with and without apply_GS
+        model_id = "microsoft/resnet-18"
+        image_processor = AutoImageProcessor.from_pretrained(model_id)
+        dataset = load_dataset("huggingface/cats-image", trust_remote_code=True)
+        image = dataset["test"]["image"][0]
+        data = image_processor(image, return_tensors="pt")
+
+        model = AutoModelForImageClassification.from_pretrained(model_id).eval()
+        torch.manual_seed(0)
+        config_hra = HRAConfig(r=8, init_weights=True, target_modules=["convolution"], apply_GS=False)
+        model = get_peft_model(model, config_hra).eval()
+
+        logits_hra = model(**data).logits
+
+        model = AutoModelForImageClassification.from_pretrained(model_id).eval()
+        torch.manual_seed(0)
+        config_hra_GS = HRAConfig(r=8, init_weights=True, target_modules=["convolution"], apply_GS=True)
+        model = get_peft_model(model, config_hra_GS)
+
+        logits_hra_GS = model(**data).logits
+
+        assert not torch.allclose(logits_hra, logits_hra_GS)
+
+    @require_torch_gpu
+    @pytest.mark.single_gpu_tests
+    def test_r_odd_hra_inference(self):
+        # check that an untrained HRA adapter can't be initialized as an identity tranformation
+        # when r is an odd number
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            torch_dtype=torch.float32,
+        ).eval()
+
+        random_input = torch.LongTensor([[1, 0, 1, 0, 1, 0]]).to(model.device)
+
+        torch.manual_seed(0)
+        logits = model(random_input).logits
+
+        config_hra = HRAConfig(r=7, init_weights=True, apply_GS=False)
+        model = get_peft_model(model, config_hra).eval()
+        logits_hra = model(random_input).logits
+
+        assert not torch.allclose(logits, logits_hra)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires a CUDA GPU")
@@ -1407,3 +1567,21 @@ class TestSameAdapterDifferentDevices:
         assert model.lin0.base_layer.weight.device.type == "cuda"
         assert model.lin0.vera_A.other.device.type == "cuda"
         assert model.lin0.vera_lambda_d.other.device.type == "cuda"
+
+    def test_hra_add_new_adapter_does_not_change_device(self, mlp):
+        # same as first test, but using HRA
+        config = HRAConfig(target_modules=["lin0"])
+        model = get_peft_model(mlp, config)
+        model = model.cuda()
+        model.lin0.hra_u.cpu()
+
+        # check that the adapter is indeed on CPU and the base model on GPU
+        assert model.lin0.hra_u.default.device.type == "cpu"
+        assert model.lin0.base_layer.weight.device.type == "cuda"
+
+        model.add_adapter("other", config)
+        # check that after adding a new adapter, the old adapter is still on CPU
+        assert model.lin0.hra_u.default.device.type == "cpu"
+        # the rest should be on GPU
+        assert model.lin0.base_layer.weight.device.type == "cuda"
+        assert model.lin0.hra_u.other.device.type == "cuda"

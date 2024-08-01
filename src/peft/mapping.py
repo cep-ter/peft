@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from peft.tuners.xlora.model import XLoraModel
+
 from .config import PeftConfig
 from .mixed_model import PeftMixedModel
 from .peft_model import (
@@ -36,6 +38,10 @@ from .tuners import (
     AdaptionPromptConfig,
     BOFTConfig,
     BOFTModel,
+    FourierFTConfig,
+    FourierFTModel,
+    HRAConfig,
+    HRAModel,
     IA3Config,
     IA3Model,
     LNTuningConfig,
@@ -56,6 +62,7 @@ from .tuners import (
     PromptTuningConfig,
     VeraConfig,
     VeraModel,
+    XLoraConfig,
 )
 from .tuners.tuners_utils import BaseTuner as _BaseTuner
 from .utils import _prepare_prompt_learning_config
@@ -81,6 +88,7 @@ PEFT_TYPE_TO_CONFIG_MAPPING: dict[str, type[PeftConfig]] = {
     "P_TUNING": PromptEncoderConfig,
     "LORA": LoraConfig,
     "LOHA": LoHaConfig,
+    "LORAPLUS": LoraConfig,
     "LOKR": LoKrConfig,
     "ADALORA": AdaLoraConfig,
     "BOFT": BOFTConfig,
@@ -90,6 +98,9 @@ PEFT_TYPE_TO_CONFIG_MAPPING: dict[str, type[PeftConfig]] = {
     "POLY": PolyConfig,
     "LN_TUNING": LNTuningConfig,
     "VERA": VeraConfig,
+    "FOURIERFT": FourierFTConfig,
+    "XLORA": XLoraConfig,
+    "HRA": HRAConfig,
 }
 
 PEFT_TYPE_TO_TUNER_MAPPING: dict[str, type[_BaseTuner]] = {
@@ -103,6 +114,9 @@ PEFT_TYPE_TO_TUNER_MAPPING: dict[str, type[_BaseTuner]] = {
     "POLY": PolyModel,
     "LN_TUNING": LNTuningModel,
     "VERA": VeraModel,
+    "FOURIERFT": FourierFTModel,
+    "XLORA": XLoraModel,
+    "HRA": HRAModel,
 }
 
 

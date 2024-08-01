@@ -24,7 +24,7 @@ from torch import svd_lowrank
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from peft.utils.integrations import dequantize_module_weight
+from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
 from peft.utils.other import transpose
 
 from .config import LoraConfig
@@ -37,7 +37,7 @@ class LoraLayer(BaseTunerLayer):
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
-    def __init__(self, base_layer: nn.Module, **kwargs) -> None:
+    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
         self.base_layer = base_layer
         self.r = {}
         self.lora_alpha = {}
@@ -54,6 +54,7 @@ class LoraLayer(BaseTunerLayer):
         self.use_dora: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
         self._caches: dict[str, Any] = {}
+        self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         self.kwargs = kwargs
 
         base_layer = self.get_base_layer()
@@ -86,7 +87,14 @@ class LoraLayer(BaseTunerLayer):
             # HQQ layers
             in_features, out_features = base_layer.in_features, base_layer.out_features
         else:
-            raise ValueError(f"Unsupported layer type {type(base_layer)}")
+            # possibly support user provided custom layer types using dynamic dispatch
+            if hasattr(base_layer, "in_features") and hasattr(base_layer, "out_features"):
+                in_features, out_features = base_layer.in_features, base_layer.out_features
+            else:
+                in_features, out_features = None, None
+            warnings.warn(
+                f"Unsupported layer type '{type(base_layer)}' encountered, proceed at your own risk.", UserWarning
+            )
 
         self.in_features = in_features
         self.out_features = out_features
@@ -114,12 +122,16 @@ class LoraLayer(BaseTunerLayer):
         else:
             self.scaling[adapter_name] = lora_alpha / r
 
+        # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
-            self.pissa_init(adapter_name, init_lora_weights)
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.pissa_init(adapter_name, init_lora_weights)
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
-            self.olora_init(adapter_name)
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.olora_init(adapter_name)
         elif init_lora_weights == "loftq":
-            self.loftq_init(adapter_name)
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.loftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
         # call this before dora_init
@@ -154,13 +166,14 @@ class LoraLayer(BaseTunerLayer):
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
     def olora_init(self, adapter_name):
-        dtype = self.base_layer.weight.dtype
+        dtype = self.get_base_layer().weight.dtype
         if dtype in [torch.int8, torch.uint8]:
-            weight_tensor = dequantize_module_weight(self.base_layer)
+            weight_tensor = dequantize_module_weight(self.get_base_layer())
         elif dtype in [torch.float32, torch.float16, torch.bfloat16]:
-            weight_tensor = self.base_layer.weight
+            weight_tensor = self.get_base_layer().weight
         else:
             raise TypeError(f"Unsupported data type for the base layer. Got {dtype}.")
+
         scale_factor = self.scaling[adapter_name]
         r = self.r[adapter_name]
         weight_tensor = weight_tensor.to(torch.float32)
@@ -239,8 +252,18 @@ class LoraLayer(BaseTunerLayer):
         dora_layer = DoraLinearLayer(fan_in_fan_out=getattr(self, "fan_in_fan_out", False))
         lora_A = self.lora_A[adapter_name].weight
         lora_B = self.lora_B[adapter_name].weight
+        place_on_cpu = self.ephemeral_gpu_offload and (lora_A.device.type == "cpu" or lora_B.device.type == "cpu")
+        if self.ephemeral_gpu_offload:
+            if lora_A.device.type == "cuda":
+                lora_B = lora_B.to(lora_A.device)
+            else:
+                if lora_B.device.type != "cuda":
+                    lora_B = lora_B.to("cuda")
+                lora_A = lora_A.to(lora_B.device)
         scaling = self.scaling[adapter_name]
-        dora_layer.update_layer(base_layer=self.get_base_layer(), lora_A=lora_A, lora_B=lora_B, scaling=scaling)
+        dora_layer.update_layer(
+            base_layer=self.get_base_layer(), lora_A=lora_A, lora_B=lora_B, scaling=scaling, place_on_cpu=place_on_cpu
+        )
         self.lora_magnitude_vector[adapter_name] = dora_layer
 
     def _cache_store(self, key: str, value: Any) -> None:
@@ -403,7 +426,7 @@ class Linear(nn.Module, LoraLayer):
                     orig_weights = base_layer.weight.data.clone()
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
-                        orig_weights = orig_weights + delta_weight
+                        orig_weights += delta_weight
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
@@ -429,7 +452,7 @@ class Linear(nn.Module, LoraLayer):
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
-                        base_layer.weight.data = base_layer.weight.data + delta_weight
+                        base_layer.weight.data += delta_weight
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
@@ -483,9 +506,9 @@ class Linear(nn.Module, LoraLayer):
         dtype = self.lora_B[adapter].weight.dtype
 
         # In case users wants to merge the adapter weights that are in
-        # float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
-        # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
-        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+        # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
         weight_A = self.lora_A[adapter].weight
         weight_B = self.lora_B[adapter].weight
@@ -636,7 +659,7 @@ class Embedding(nn.Module, LoraLayer):
                     # Note that safe_merge will be slower than the normal merge
                     # because of the copy operation.
                     orig_weights = base_layer.weight.data.clone()
-                    orig_weights = orig_weights + self.get_delta_weight(active_adapter)
+                    orig_weights += self.get_delta_weight(active_adapter)
 
                     if not torch.isfinite(orig_weights).all():
                         raise ValueError(
@@ -645,7 +668,7 @@ class Embedding(nn.Module, LoraLayer):
 
                     base_layer.weight.data = orig_weights
                 else:
-                    base_layer.weight.data = base_layer.weight.data + self.get_delta_weight(active_adapter)
+                    base_layer.weight.data += self.get_delta_weight(active_adapter)
                 self.merged_adapters.append(active_adapter)
 
     def unmerge(self) -> None:
@@ -672,9 +695,9 @@ class Embedding(nn.Module, LoraLayer):
         dtype = self.lora_embedding_A[adapter].dtype
 
         # In case users wants to merge the adapter weights that are in
-        # float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
-        # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
-        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+        # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
         weight_A = self.lora_embedding_A[adapter]
         weight_B = self.lora_embedding_B[adapter]
@@ -877,7 +900,7 @@ class Conv2d(nn.Module, LoraLayer):
                     delta_weight = self.get_delta_weight(active_adapter)
 
                     if not self.use_dora[active_adapter]:
-                        orig_weights = orig_weights + delta_weight
+                        orig_weights += delta_weight
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
@@ -901,7 +924,7 @@ class Conv2d(nn.Module, LoraLayer):
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
-                        base_layer.weight.data = base_layer.weight.data + delta_weight
+                        base_layer.weight.data += delta_weight
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
@@ -952,9 +975,9 @@ class Conv2d(nn.Module, LoraLayer):
         dtype = self.lora_A[adapter].weight.dtype
 
         # In case users wants to merge the adapter weights that are in
-        # float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
-        # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
-        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+        # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
         weight_A = self.lora_A[adapter].weight
         weight_B = self.lora_B[adapter].weight
